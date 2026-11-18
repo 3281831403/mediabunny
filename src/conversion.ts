@@ -654,8 +654,10 @@ export type DiscardedTrack = {
 	 * - `'no_encodable_target_codec'`: We can't find a codec that we are able to encode and that can be contained
 	 * within the output format. This reason can be hit if the environment doesn't support the necessary encoders, or if
 	 * you requested a codec that cannot be contained within the output format.
-	 * - `'cannot_copy'`: {@link ConversionCopyOptions.mode} was set to `'forced'` but the track could not be copied
-	 * with the given copy configuration because it would require a transcode instead.
+	 * - `'cannot_copy'`: The track could not be copied with the given copy configuration, and transcoding it
+	 * instead was not possible. This happens when {@link ConversionCopyOptions.mode} is `'forced'` but the track
+	 * would require a transcode, or when the copy configuration (like the timestamp shift or boundary tolerances)
+	 * ruled out copying and the track cannot be decoded for transcoding in this environment.
 	 * - `'unknown_maximum_packet_count'`: The output format requires a maximum packet count, but it can't be estimated
 	 * because the track is live and no trim end is set. Set it manually using the `maximumPacketCount` track option.
 	 */
@@ -1613,6 +1615,10 @@ export class Conversion {
 			|| (totalFlip && !canUseRotationMetadata)
 			|| !!crop;
 
+		// Tracks whether the transcode was necessitated purely by the copy configuration (timestamp or
+		// boundary constraints) rather than by the track itself or explicit user options
+		let copyPolicyForcedTranscode = false;
+
 		let copyStartPacket: EncodedPacket | null = null;
 
 		if (!needsTranscode) {
@@ -1646,6 +1652,7 @@ export class Conversion {
 
 				if (boundaryDeviation > this._copyBoundaryTolerance) {
 					needsTranscode = true;
+					copyPolicyForcedTranscode = true;
 				} else if (!this.output.format.supportsTimestampedMediaData) {
 					// Wants zero
 
@@ -1654,6 +1661,7 @@ export class Conversion {
 						const isValid = effectiveStartTimestamp + this._timestampOffset === 0;
 						if (!isValid) {
 							needsTranscode = true;
+							copyPolicyForcedTranscode = true;
 						}
 					} else {
 						const correction = clamp(
@@ -1670,28 +1678,34 @@ export class Conversion {
 							this._timestampOffsetAdjusted = true;
 						} else {
 							needsTranscode = true;
+							copyPolicyForcedTranscode = true;
 						}
 					}
 				} else if (
 					this.output.format.negativeTimestampSupport !== 'full'
 					&& effectiveStartTimestamp < this._startTimestamp
 				) {
-					const correction = Math.min(
-						this._startTimestamp - effectiveStartTimestamp,
+					// A timestamp offset inherently applied by the output format (like MPEG-TS'
+					// timestampOffset) lifts all written timestamps and therefore counts towards keeping
+					// them non-negative
+					const inherentOffset = this.output.format._inherentTimestampOffset;
+					const correction = clamp(
+						this._startTimestamp - effectiveStartTimestamp - inherentOffset,
+						0,
 						this._copyTimestampShiftTolerance,
 					);
 
-					const shiftedStartTimestamp = effectiveStartTimestamp + correction;
+					const shiftedStartTimestamp = effectiveStartTimestamp + inherentOffset + correction;
 					const isValid = shiftedStartTimestamp >= this._startTimestamp
-						|| (
-							this.output.format.negativeTimestampSupport === 'prefer-non-negative'
-							&& this._copyMode === 'forced'
-						);
+						// Negative timestamps are discouraged but writable, so let's still copy instead of
+						// transcode when we can't lift them far enough
+						|| this.output.format.negativeTimestampSupport === 'prefer-non-negative';
 
 					if (isValid) {
 						this._timestampOffset = Math.max(this._timestampOffset, -this._startTimestamp + correction);
 					} else {
 						needsTranscode = true;
+						copyPolicyForcedTranscode = true;
 					}
 				}
 			}
@@ -1830,7 +1844,9 @@ export class Conversion {
 			if (!canDecode) {
 				this.discardedTracks.push({
 					track,
-					reason: 'undecodable_source_codec',
+					// If copying was on the table and only the copy configuration ruled it out, the
+					// discard is due to that configuration, not due to the track being undecodable
+					reason: copyPolicyForcedTranscode ? 'cannot_copy' : 'undecodable_source_codec',
 					trackOptions,
 				});
 				return;
@@ -2099,6 +2115,10 @@ export class Conversion {
 			|| trackOptions.process !== undefined
 			|| trackOptions.sampleFormat !== undefined;
 
+		// Tracks whether the transcode was necessitated purely by the copy configuration (timestamp or
+		// boundary constraints) rather than by the track itself or explicit user options
+		let copyPolicyForcedTranscode = false;
+
 		let copyStartPacket: EncodedPacket | null = null;
 
 		if (!needsTranscode) {
@@ -2146,6 +2166,7 @@ export class Conversion {
 
 				if (boundaryDeviation > this._copyBoundaryTolerance) {
 					needsTranscode = true;
+					copyPolicyForcedTranscode = true;
 				} else if (!this.output.format.supportsTimestampedMediaData) {
 					// Wants zero
 
@@ -2154,6 +2175,7 @@ export class Conversion {
 						const isValid = startPacket.timestamp + this._timestampOffset === 0;
 						if (!isValid) {
 							needsTranscode = true;
+							copyPolicyForcedTranscode = true;
 						}
 					} else {
 						const correction = clamp(
@@ -2170,28 +2192,34 @@ export class Conversion {
 							this._timestampOffsetAdjusted = true;
 						} else {
 							needsTranscode = true;
+							copyPolicyForcedTranscode = true;
 						}
 					}
 				} else if (
 					this.output.format.negativeTimestampSupport !== 'full'
 					&& startPacket.timestamp < this._startTimestamp
 				) {
-					const correction = Math.min(
-						this._startTimestamp - startPacket.timestamp,
+					// A timestamp offset inherently applied by the output format (like MPEG-TS'
+					// timestampOffset) lifts all written timestamps and therefore counts towards keeping
+					// them non-negative
+					const inherentOffset = this.output.format._inherentTimestampOffset;
+					const correction = clamp(
+						this._startTimestamp - startPacket.timestamp - inherentOffset,
+						0,
 						this._copyTimestampShiftTolerance,
 					);
 
-					const shiftedStartTimestamp = startPacket.timestamp + correction;
+					const shiftedStartTimestamp = startPacket.timestamp + inherentOffset + correction;
 					const isValid = shiftedStartTimestamp >= this._startTimestamp
-						|| (
-							this.output.format.negativeTimestampSupport === 'prefer-non-negative'
-							&& this._copyMode === 'forced'
-						);
+						// Negative timestamps are discouraged but writable, so let's still copy instead of
+						// transcode when we can't lift them far enough
+						|| this.output.format.negativeTimestampSupport === 'prefer-non-negative';
 
 					if (isValid) {
 						this._timestampOffset = Math.max(this._timestampOffset, -this._startTimestamp + correction);
 					} else {
 						needsTranscode = true;
+						copyPolicyForcedTranscode = true;
 					}
 				}
 			}
@@ -2284,7 +2312,9 @@ export class Conversion {
 			if (!canDecode) {
 				this.discardedTracks.push({
 					track,
-					reason: 'undecodable_source_codec',
+					// If copying was on the table and only the copy configuration ruled it out, the
+					// discard is due to that configuration, not due to the track being undecodable
+					reason: copyPolicyForcedTranscode ? 'cannot_copy' : 'undecodable_source_codec',
 					trackOptions,
 				});
 				return;

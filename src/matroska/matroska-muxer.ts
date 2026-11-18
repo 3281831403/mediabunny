@@ -1299,10 +1299,35 @@ export class MatroskaMuxer extends Muxer {
 			previousMsTimestamp: trackData.lastWrittenMsTimestamp,
 		});
 
-		this.endTimestamp = Math.max(this.endTimestamp, msTimestamp + Math.round(1000 * chunk.duration));
+		// Audio timestamps are shifted into the future by the track's codec delay, so subtract it back out
+		// to keep the segment duration aligned with the actual end of the media
+		const codecDelayMs = trackData.type === 'audio'
+			? Math.round(1000 * (trackData.info.codecDelay ?? 0))
+			: 0;
+		this.endTimestamp = Math.max(
+			this.endTimestamp,
+			msTimestamp + Math.round(1000 * chunk.duration) - codecDelayMs,
+		);
 		trackData.lastWrittenMsTimestamp = msTimestamp;
 
 		this.currentClusterMaxMsTimestamp = Math.max(this.currentClusterMaxMsTimestamp!, msTimestamp);
+	}
+
+	/** The minimum codec delay across all tracks, in milliseconds. Mirrors the demuxer's computation. */
+	private getMinCodecDelayMs() {
+		if (this.trackDatas.length === 0) {
+			return 0;
+		}
+
+		let minDelayMs = Infinity;
+		for (const trackData of this.trackDatas) {
+			const delayMs = trackData.type === 'audio'
+				? Math.round(1000 * (trackData.info.codecDelay ?? 0))
+				: 0;
+			minDelayMs = Math.min(minDelayMs, delayMs);
+		}
+
+		return minDelayMs;
 	}
 
 	/** Writes out the current cluster, if any, and begins a new one. */
@@ -1497,8 +1522,10 @@ export class MatroskaMuxer extends Muxer {
 				this.writer.seek(this.ebmlWriter.offsets.get(this.segment!)! + 4);
 				this.ebmlWriter.writeVarInt(segmentSize, SEGMENT_SIZE_BYTES);
 
-				// Write the duration of the media to the Segment
-				const duration = Math.max(this.endTimestamp, 0);
+				// Write the duration of the media to the Segment. Readers treat this field as the end
+				// timestamp of the segment minus the minimum codec delay across all tracks (mirroring
+				// FFmpeg), so we add that delay back here to make the two sides agree.
+				const duration = Math.max(this.endTimestamp, 0) + this.getMinCodecDelayMs();
 				this.segmentDuration!.data = new EBMLFloat64(duration);
 				this.writer.seek(this.ebmlWriter.offsets.get(this.segmentDuration!)!);
 				this.ebmlWriter.writeEBML(this.segmentDuration);

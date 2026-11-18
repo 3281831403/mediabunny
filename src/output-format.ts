@@ -103,6 +103,17 @@ export abstract class OutputFormat {
 	abstract get negativeTimestampSupport(): 'full' | 'prefer-non-negative' | 'none' | null;
 
 	/**
+	 * A timestamp offset in seconds that this format inherently applies to all media data written to it (like
+	 * {@link MpegTsOutputFormatOptions.timestampOffset}). Since this offset lifts all written timestamps, it
+	 * counts towards keeping them non-negative.
+	 *
+	 * @internal
+	 */
+	get _inherentTimestampOffset() {
+		return 0;
+	}
+
+	/**
 	 * Whether this output format, as configured, requires {@link BaseTrackMetadata.maximumPacketCount} to be set in
 	 * the metadata of every track added to it.
 	 */
@@ -1264,6 +1275,11 @@ export class MpegTsOutputFormat extends OutputFormat {
 	get negativeTimestampSupport() {
 		return 'prefer-non-negative' as const;
 	}
+
+	/** @internal */
+	override get _inherentTimestampOffset() {
+		return this._options.timestampOffset ?? 0;
+	}
 }
 
 /**
@@ -1567,6 +1583,12 @@ export class HlsOutputFormat extends OutputFormat {
 		}
 
 		return null;
+	}
+
+	/** @internal */
+	override get _inherentTimestampOffset() {
+		// Segment timestamps are rebased onto the media timestamp base, which lifts all written timestamps
+		return this._options.mediaTimestampBase ?? 10;
 	}
 
 	/** @internal */
