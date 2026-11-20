@@ -153,10 +153,18 @@ type InternalTrack = {
 		endDecodeTimestamp: number;
 		hasKeyFrame: boolean;
 	}[];
-	/** The segment durations of all edit list entries leading up to the main one (from which the offset is taken.) */
-	editListPreviousSegmentDurations: number;
-	/** The media time offset of the main edit list entry (with media time !== -1) */
-	editListOffset: number;
+	/** The track's edit list as parsed from the elst box, or null if there is none (or it is empty). */
+	editList: EditListEntry[] | null;
+	/**
+	 * The media-playing segments of the edit list, derived from `editList` and used to map between media time and
+	 * presentation time. Null when there is no edit list, in which case the mapping is the identity.
+	 */
+	editSegments: EditSegment[] | null;
+	/**
+	 * The total duration of the track's presentation timeline as defined by the edit list, in seconds. Null when
+	 * there is no edit list or when the edit list is open-ended (a zero-duration final segment).
+	 */
+	editListDuration: number | null;
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
@@ -202,6 +210,26 @@ type InternalTrack = {
 
 type InternalVideoTrack = InternalTrack & {	info: { type: 'video' } };
 type InternalAudioTrack = InternalTrack & {	info: { type: 'audio' } };
+
+type EditListEntry = {
+	/** In movie timescale units. */
+	segmentDuration: number;
+	/** In track (media) timescale units. -1 indicates an empty edit (dwell) that plays no media. */
+	mediaTime: number;
+	mediaRate: number;
+};
+
+/** A media-playing segment of an edit list, used to map between media time and presentation time. */
+type EditSegment = {
+	/** Start of this segment on the presentation timeline, in seconds. */
+	presentationStart: number;
+	/** Duration of this segment on the presentation timeline, in seconds. Infinity when open-ended. */
+	presentationDuration: number;
+	/** Start of the covered media interval, in track timescale units. */
+	mediaStart: number;
+	/** End of the covered media interval (exclusive), in track timescale units. May be Infinity. */
+	mediaEnd: number;
+};
 
 type SampleTable = {
 	sampleTimingEntries: SampleTimingEntry[];
@@ -440,11 +468,9 @@ export class IsobmffDemuxer extends Demuxer {
 					}
 
 					for (const track of this.tracks) {
-						// Modify the edit list offset based on the previous segment durations. They are in different
-						// timescales, so we first convert to seconds and then into the track timescale.
-						const previousSegmentDurationsInSeconds
-							= track.editListPreviousSegmentDurations / this.movieTimescale;
-						track.editListOffset -= Math.round(previousSegmentDurationsInSeconds * track.timescale);
+						// The movie timescale is only known now, so the edit segments couldn't be computed while
+						// parsing the tracks
+						computeEditSegments(track, this.movieTimescale);
 					}
 
 					lookForMfraBox = this.isFragmented
@@ -564,8 +590,9 @@ export class IsobmffDemuxer extends Demuxer {
 				sampleTable: null,
 				fragmentLookupTable: [],
 				fragmentPositionCache: [],
-				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
-				editListOffset: foreignTrack.editListOffset,
+				editList: foreignTrack.editList,
+				editSegments: null,
+				editListDuration: null,
 				encryptionInfo: foreignTrack.encryptionInfo,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
@@ -573,6 +600,8 @@ export class IsobmffDemuxer extends Demuxer {
 				avgBitrate: foreignTrack.avgBitrate,
 				info: foreignTrack.info,
 			};
+
+			computeEditSegments(track, this.movieTimescale);
 
 			if (foreignTrack.trackBacking) {
 				assert(track.info);
@@ -1069,8 +1098,9 @@ export class IsobmffDemuxer extends Demuxer {
 					sampleTable: null,
 					fragmentLookupTable: [],
 					fragmentPositionCache: [],
-					editListPreviousSegmentDurations: 0,
-					editListOffset: 0,
+					editList: null,
+					editSegments: null,
+					editListDuration: null,
 					encryptionInfo: null,
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
@@ -1148,8 +1178,8 @@ export class IsobmffDemuxer extends Demuxer {
 				const version = readU8(slice);
 				slice.skip(3); // Flags
 
-				let relevantEntryFound = false;
-				let previousSegmentDurations = 0;
+				const editList: EditListEntry[] = [];
+				let valid = true;
 
 				const entryCount = readU32Be(slice);
 				for (let i = 0; i < entryCount; i++) {
@@ -1161,27 +1191,17 @@ export class IsobmffDemuxer extends Demuxer {
 						: readI32Be(slice);
 					const mediaRate = readFixed_16_16(slice);
 
-					if (relevantEntryFound) {
-						Logging._warn(
-							'Unsupported edit list: multiple edits are not currently supported. Only using first edit.',
-						);
+					if (mediaTime !== -1 && mediaRate !== 1) {
+						Logging._warn('Unsupported edit list entry: media rate must be 1. Ignoring the edit list.');
+						valid = false;
 						break;
 					}
 
-					if (mediaTime === -1) {
-						previousSegmentDurations += segmentDuration;
-						continue;
-					}
-
-					if (mediaRate !== 1) {
-						Logging._warn('Unsupported edit list entry: media rate must be 1.');
-						break;
-					}
-
-					track.editListPreviousSegmentDurations = previousSegmentDurations;
-					track.editListOffset = mediaTime;
-					relevantEntryFound = true;
+					editList.push({ segmentDuration, mediaTime, mediaRate });
 				}
+
+				// An empty edit list is equivalent to having no edit list at all
+				track.editList = valid && editList.length > 0 ? editList : null;
 			}; break;
 
 			case 'mdhd': {
@@ -3273,6 +3293,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			return null;
 		}
 
+		if (track.editSegments && track.editListDuration !== null) {
+			// The edit list defines the exact presented duration
+			return track.editListDuration;
+		}
+
 		assert(track.trackBacking);
 
 		const firstPacket = await track.trackBacking.getFirstPacket({ metadataOnly: true });
@@ -3284,7 +3309,11 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 	}
 
 	async getFirstPacket(options: PacketRetrievalOptions) {
-		const regularPacket = await this.fetchPacketForSampleIndex(0, options);
+		const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+		const regularPacket = await this.fetchPacketForSampleIndex(
+			this.findFirstPresentedSampleIndex(sampleTable),
+			options,
+		);
 		if (regularPacket || !this.internalTrack.demuxer.isFragmented) {
 			// If there's a non-fragmented packet, always prefer that
 			return regularPacket;
@@ -3293,18 +3322,122 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		return this.fetchFirstFragmentedPacket(false, options);
 	}
 
-	private mapTimestampIntoTimescale(timestamp: number) {
-		// Do a little rounding to catch cases where the result is very close to an integer. If it is, it's likely
-		// that the number was originally an integer divided by the timescale. For stability, it's best
-		// to return the integer in this case.
-		return roundIfAlmostInteger(timestamp * this.internalTrack.timescale) + this.internalTrack.editListOffset;
+	/** Returns the index of the first sample (in decode order) that is part of the presented timeline. */
+	private findFirstPresentedSampleIndex(sampleTable: SampleTable) {
+		if (!this.internalTrack.editSegments) {
+			return 0;
+		}
+
+		for (let i = 0; i < sampleTable.sampleCount; i++) {
+			const sampleInfo = getSampleInfo(sampleTable, i);
+			if (
+				sampleInfo
+				&& mapMediaTimestampToPresentation(this.internalTrack, sampleInfo.presentationTimestamp) !== null
+			) {
+				return i;
+			}
+		}
+
+		return -1;
+	}
+
+	/**
+	 * Returns the index of the next sample (in decode order) after the given sample index that is part of the
+	 * presented timeline. Returns the sample count if there is none.
+	 */
+	private findNextPresentedSampleIndex(sampleIndex: number) {
+		const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+		if (!this.internalTrack.editSegments) {
+			return sampleIndex + 1;
+		}
+
+		for (let i = sampleIndex + 1; i < sampleTable.sampleCount; i++) {
+			const sampleInfo = getSampleInfo(sampleTable, i);
+			if (
+				sampleInfo
+				&& mapMediaTimestampToPresentation(this.internalTrack, sampleInfo.presentationTimestamp) !== null
+			) {
+				return i;
+			}
+		}
+
+		return sampleTable.sampleCount;
+	}
+
+	/**
+	 * Returns the index of the last presented sample (in presentation order) whose media timestamp is at most
+	 * `mediaTimestamp`, or -1 if there is none.
+	 */
+	private findLastPresentedSampleIndex(
+		sampleTable: SampleTable,
+		mediaTimestamp: number,
+		keyFramesOnly: boolean,
+	) {
+		const segments = this.internalTrack.editSegments;
+		if (!segments) {
+			return keyFramesOnly
+				? getKeyframeSampleIndexForTimestamp(sampleTable, mediaTimestamp)
+				: getSampleIndexForTimestamp(sampleTable, mediaTimestamp);
+		}
+
+		// Find the index of the edit segment containing the media timestamp
+		let startSegmentIndex = segments.length - 1;
+		for (let i = 0; i < segments.length; i++) {
+			if (mediaTimestamp < segments[i]!.mediaEnd) {
+				startSegmentIndex = i;
+				break;
+			}
+		}
+
+		// Walk the segments backwards until we find a presented sample
+		for (let i = startSegmentIndex; i >= 0; i--) {
+			const segment = segments[i]!;
+			const target = Math.min(mediaTimestamp, segment.mediaEnd - 1);
+			if (i !== 0 && target < segment.mediaStart) {
+				continue;
+			}
+
+			const sampleIndex = keyFramesOnly
+				? getKeyframeSampleIndexForTimestamp(sampleTable, target)
+				: getSampleIndexForTimestamp(sampleTable, target);
+			if (sampleIndex === -1) {
+				continue;
+			}
+
+			const sampleInfo = getSampleInfo(sampleTable, sampleIndex);
+			if (
+				sampleInfo
+				&& mapMediaTimestampToPresentation(this.internalTrack, sampleInfo.presentationTimestamp) !== null
+			) {
+				return sampleIndex;
+			}
+		}
+
+		return -1;
+	}
+
+	/** Maps a presentation timestamp query (in seconds) to a media timestamp (in track timescale units). */
+	private mapQueryTimestampToMedia(timestamp: number) {
+		const track = this.internalTrack;
+		if (timestamp === Infinity) {
+			// Map to the end of the last edit segment so that the last presented sample is found
+			const segments = track.editSegments;
+			return segments ? last(segments).mediaEnd - 1 : Infinity;
+		}
+
+		// Returns null when the timestamp lies outside the presented timeline
+		return mapPresentationTimestampToMedia(track, timestamp);
 	}
 
 	async getPacket(timestamp: number, options: PacketRetrievalOptions) {
-		const timestampInTimescale = this.mapTimestampIntoTimescale(timestamp);
+		const timestampInTimescale = this.mapQueryTimestampToMedia(timestamp);
+		if (timestampInTimescale === null) {
+			// The timestamp lies outside the presented timeline
+			return null;
+		}
 
 		const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
-		const sampleIndex = getSampleIndexForTimestamp(sampleTable, timestampInTimescale);
+		const sampleIndex = this.findLastPresentedSampleIndex(sampleTable, timestampInTimescale, false);
 		const regularPacket = await this.fetchPacketForSampleIndex(sampleIndex, options, timestampInTimescale);
 
 		if (!this.internalTrack.demuxer.isFragmented) {
@@ -3319,11 +3452,22 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 					return { sampleIndex: -1, correctSampleFound: false };
 				}
 
-				const index = binarySearchLessOrEqual(
+				let index = binarySearchLessOrEqual(
 					trackData.presentationTimestamps,
 					timestampInTimescale,
 					x => x.presentationTimestamp,
 				);
+
+				// Walk back to the last presented sample, skipping ones trimmed away by the edit list
+				while (
+					index !== -1
+					&& mapMediaTimestampToPresentation(
+						this.internalTrack,
+						trackData.presentationTimestamps[index]!.presentationTimestamp,
+					) === null
+				) {
+					index--;
+				}
 
 				const sampleIndex = index !== -1 ? trackData.presentationTimestamps[index]!.sampleIndex : -1;
 				const correctSampleFound = index !== -1 && timestampInTimescale < trackData.endTimestamp;
@@ -3353,7 +3497,10 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 		if (regularSampleIndex !== undefined) {
 			// Prefer the non-fragmented packet
-			const regularPacket = await this.fetchPacketForSampleIndex(regularSampleIndex + 1, options);
+			const regularPacket = await this.fetchPacketForSampleIndex(
+				this.findNextPresentedSampleIndex(regularSampleIndex),
+				options,
+			);
 			if (regularPacket || !this.internalTrack.demuxer.isFragmented) {
 				return regularPacket;
 			}
@@ -3372,20 +3519,28 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			(fragment) => {
 				if (fragment === locationInFragment.fragment) {
 					const trackData = fragment.trackData.get(this.internalTrack.id)!;
-					if (locationInFragment.sampleIndex + 1 < trackData.samples.length) {
-						// We can simply take the next sample in the fragment
+					const sampleIndex = this.findNextPresentedFragmentSampleIndex(
+						trackData,
+						locationInFragment.sampleIndex,
+						false,
+					);
+					if (sampleIndex !== -1) {
+						// We can simply take the next presented sample in the fragment
 						return {
-							sampleIndex: locationInFragment.sampleIndex + 1,
+							sampleIndex,
 							correctSampleFound: true,
 						};
 					}
 				} else {
 					const trackData = fragment.trackData.get(this.internalTrack.id);
 					if (trackData) {
-						return {
-							sampleIndex: 0,
-							correctSampleFound: true,
-						};
+						const sampleIndex = this.findNextPresentedFragmentSampleIndex(trackData, -1, false);
+						if (sampleIndex !== -1) {
+							return {
+								sampleIndex,
+								correctSampleFound: true,
+							};
+						}
 					}
 				}
 
@@ -3401,10 +3556,14 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 	}
 
 	async getKeyPacket(timestamp: number, options: PacketRetrievalOptions) {
-		const timestampInTimescale = this.mapTimestampIntoTimescale(timestamp);
+		const timestampInTimescale = this.mapQueryTimestampToMedia(timestamp);
+		if (timestampInTimescale === null) {
+			// The timestamp lies outside the presented timeline
+			return null;
+		}
 
 		const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
-		const sampleIndex = getKeyframeSampleIndexForTimestamp(sampleTable, timestampInTimescale);
+		const sampleIndex = this.findLastPresentedSampleIndex(sampleTable, timestampInTimescale, true);
 		const regularPacket = await this.fetchPacketForSampleIndex(sampleIndex, options, timestampInTimescale);
 
 		if (!this.internalTrack.demuxer.isFragmented) {
@@ -3421,7 +3580,9 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 				const index = findLastIndex(trackData.presentationTimestamps, (x) => {
 					const sample = trackData.samples[x.sampleIndex]!;
-					return sample.isKeyFrame && x.presentationTimestamp <= timestampInTimescale;
+					return sample.isKeyFrame
+						&& x.presentationTimestamp <= timestampInTimescale
+						&& mapMediaTimestampToPresentation(this.internalTrack, x.presentationTimestamp) !== null;
 				});
 
 				const sampleIndex = index !== -1 ? trackData.presentationTimestamps[index]!.sampleIndex : -1;
@@ -3453,7 +3614,21 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		if (regularSampleIndex !== undefined) {
 			// Prefer the non-fragmented packet
 			const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
-			const nextKeyFrameSampleIndex = getNextKeyframeIndexForSample(sampleTable, regularSampleIndex);
+			let nextKeyFrameSampleIndex = getNextKeyframeIndexForSample(sampleTable, regularSampleIndex);
+
+			// Skip over key frames that are trimmed away by the edit list
+			while (nextKeyFrameSampleIndex !== -1 && this.internalTrack.editSegments) {
+				const sampleInfo = getSampleInfo(sampleTable, nextKeyFrameSampleIndex);
+				if (!sampleInfo) {
+					break;
+				}
+				if (mapMediaTimestampToPresentation(this.internalTrack, sampleInfo.presentationTimestamp) !== null) {
+					break;
+				}
+
+				nextKeyFrameSampleIndex = getNextKeyframeIndexForSample(sampleTable, nextKeyFrameSampleIndex);
+			}
+
 			const regularPacket = await this.fetchPacketForSampleIndex(nextKeyFrameSampleIndex, options);
 			if (regularPacket || !this.internalTrack.demuxer.isFragmented) {
 				return regularPacket;
@@ -3473,26 +3648,28 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			(fragment) => {
 				if (fragment === locationInFragment.fragment) {
 					const trackData = fragment.trackData.get(this.internalTrack.id)!;
-
-					for (let i = locationInFragment.sampleIndex + 1; i < trackData.samples.length; i++) {
-						if (trackData.samples[i]!.isKeyFrame) {
-							// We can simply take the next key frame in the fragment
-							return {
-								sampleIndex: i,
-								correctSampleFound: true,
-							};
-						}
+					const sampleIndex = this.findNextPresentedFragmentSampleIndex(
+						trackData,
+						locationInFragment.sampleIndex,
+						true,
+					);
+					if (sampleIndex !== -1) {
+						// We can simply take the next presented key frame in the fragment
+						return {
+							sampleIndex,
+							correctSampleFound: true,
+						};
 					}
 				} else {
 					const trackData = fragment.trackData.get(this.internalTrack.id);
 					if (trackData && trackData.firstKeyFrameTimestamp !== null) {
-						const keyFrameIndex = trackData.samples.findIndex(x => x.isKeyFrame);
-						assert(keyFrameIndex !== -1); // There must be one
-
-						return {
-							sampleIndex: keyFrameIndex,
-							correctSampleFound: true,
-						};
+						const keyFrameIndex = this.findNextPresentedFragmentSampleIndex(trackData, -1, true);
+						if (keyFrameIndex !== -1) {
+							return {
+								sampleIndex: keyFrameIndex,
+								correctSampleFound: true,
+							};
+						}
 					}
 				}
 
@@ -3507,12 +3684,38 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		);
 	}
 
+	/**
+	 * Returns the index of the next sample in the fragment after the given sample index that is part of the
+	 * presented timeline, or -1 if there is none.
+	 */
+	private findNextPresentedFragmentSampleIndex(
+		trackData: FragmentTrackData,
+		sampleIndex: number,
+		keyFramesOnly: boolean,
+	) {
+		for (let i = sampleIndex + 1; i < trackData.samples.length; i++) {
+			const sample = trackData.samples[i]!;
+			if (keyFramesOnly && !sample.isKeyFrame) {
+				continue;
+			}
+			if (mapMediaTimestampToPresentation(this.internalTrack, sample.presentationTimestamp) === null) {
+				continue;
+			}
+
+			return i;
+		}
+
+		return -1;
+	}
+
 	private fetchFirstFragmentedPacket(keyPacketsOnly: boolean, options: PacketRetrievalOptions) {
 		return this.performFragmentedLookup(
 			null,
 			(fragment) => {
 				const trackData = fragment.trackData.get(this.internalTrack.id);
-				const sampleIndex = trackData?.samples.findIndex(x => !keyPacketsOnly || x.isKeyFrame) ?? -1;
+				const sampleIndex = trackData
+					? this.findNextPresentedFragmentSampleIndex(trackData, -1, keyPacketsOnly)
+					: -1;
 
 				return {
 					sampleIndex,
@@ -3577,8 +3780,12 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 		}
 
-		const timestamp = (sampleInfo.presentationTimestamp - this.internalTrack.editListOffset)
-			/ this.internalTrack.timescale;
+		const timestamp = mapMediaTimestampToPresentation(this.internalTrack, sampleInfo.presentationTimestamp);
+		if (timestamp === null) {
+			// The sample is trimmed away by the edit list
+			return null;
+		}
+
 		const duration = sampleInfo.duration / this.internalTrack.timescale;
 		const packet = new EncodedPacket(
 			data,
@@ -3636,8 +3843,12 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 		}
 
-		const timestamp = (fragmentSample.presentationTimestamp - this.internalTrack.editListOffset)
-			/ this.internalTrack.timescale;
+		const timestamp = mapMediaTimestampToPresentation(this.internalTrack, fragmentSample.presentationTimestamp);
+		if (timestamp === null) {
+			// The sample is trimmed away by the edit list
+			return null;
+		}
+
 		const duration = fragmentSample.duration / this.internalTrack.timescale;
 		const packet = new EncodedPacket(
 			data,
@@ -3821,8 +4032,9 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			size: samplePacket.data.byteLength,
 			blockCount: 6,
 		}];
-		const searchTimestampInSeconds = (searchTimestamp - this.internalTrack.editListOffset)
-			/ this.internalTrack.timescale;
+		const searchTimestampInSeconds = searchTimestamp === -Infinity || searchTimestamp === Infinity
+			? searchTimestamp
+			: mapMediaTimestampToPresentation(this.internalTrack, searchTimestamp) ?? -Infinity;
 
 		let match: EncodedPacket | null = null;
 		let previousPacket: EncodedPacket | null = null;
@@ -4050,6 +4262,114 @@ class IsobmffAudioTrackBacking extends IsobmffTrackBacking implements InputAudio
 		})();
 	}
 }
+
+/** Computes the presentation timeline segments of a track's edit list. Call once the movie timescale is known. */
+const computeEditSegments = (track: InternalTrack, movieTimescale: number) => {
+	track.editSegments = null;
+	track.editListDuration = null;
+
+	if (!track.editList) {
+		return;
+	}
+
+	const segments: EditSegment[] = [];
+	let presentationCursor = 0; // In seconds
+	let openEnded = false;
+
+	for (const entry of track.editList) {
+		const segmentDuration = entry.segmentDuration / movieTimescale;
+
+		if (entry.mediaTime !== -1) {
+			// An edit is open-ended when its duration is zero (common in fragmented files where the duration is
+			// not yet known) or when it reaches to the end of the media; in both cases, it plays the rest of the
+			// media from the given media time on.
+			const isOpenEnded = entry.segmentDuration === 0
+				|| (
+					track.durationInMediaTimescale > 0
+					&& entry.mediaTime + Math.round(segmentDuration * track.timescale)
+					>= track.durationInMediaTimescale
+				);
+
+			if (isOpenEnded) {
+				segments.push({
+					presentationStart: presentationCursor,
+					presentationDuration: Infinity,
+					mediaStart: entry.mediaTime,
+					mediaEnd: Infinity,
+				});
+				openEnded = true;
+			} else {
+				segments.push({
+					presentationStart: presentationCursor,
+					presentationDuration: segmentDuration,
+					mediaStart: entry.mediaTime,
+					mediaEnd: entry.mediaTime + Math.round(segmentDuration * track.timescale),
+				});
+			}
+		}
+
+		presentationCursor += segmentDuration;
+	}
+
+	if (segments.length === 0) {
+		// The edit list plays no media at all (e.g. only empty edits); treat it like having no edit list
+		return;
+	}
+
+	track.editSegments = segments;
+	track.editListDuration = openEnded ? null : presentationCursor;
+};
+
+/**
+ * Maps a media timestamp (in track timescale units) to a presentation timestamp (in seconds). Media timestamps
+ * before the first edit segment are extrapolated from it, producing negative (preroll) timestamps; media
+ * timestamps beyond the last edit segment or in a gap between segments are not presented and map to null.
+ */
+const mapMediaTimestampToPresentation = (track: InternalTrack, mediaTimestamp: number): number | null => {
+	const segments = track.editSegments;
+	if (!segments) {
+		return mediaTimestamp / track.timescale;
+	}
+
+	for (const segment of segments) {
+		if (mediaTimestamp < segment.mediaEnd) {
+			if (segment !== segments[0] && mediaTimestamp < segment.mediaStart) {
+				return null; // Lies in a gap between two segments
+			}
+
+			return segment.presentationStart + (mediaTimestamp - segment.mediaStart) / track.timescale;
+		}
+	}
+
+	return null; // Lies beyond the last segment
+};
+
+/**
+ * Maps a presentation timestamp (in seconds) to a media timestamp (in track timescale units). Presentation
+ * timestamps before the first edit segment are extrapolated from it; presentation timestamps beyond the last
+ * edit segment or in a gap between segments map to null.
+ */
+const mapPresentationTimestampToMedia = (track: InternalTrack, presentationTimestamp: number): number | null => {
+	const segments = track.editSegments;
+	if (!segments) {
+		return roundIfAlmostInteger(presentationTimestamp * track.timescale);
+	}
+
+	for (const segment of segments) {
+		const segmentEnd = segment.presentationStart + segment.presentationDuration;
+		if (presentationTimestamp < segmentEnd) {
+			if (segment !== segments[0] && presentationTimestamp < segment.presentationStart) {
+				return null; // Lies in a gap between two segments
+			}
+
+			return roundIfAlmostInteger(
+				segment.mediaStart + (presentationTimestamp - segment.presentationStart) * track.timescale,
+			);
+		}
+	}
+
+	return null; // Lies beyond the last segment
+};
 
 const getSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleUnits: number) => {
 	if (sampleTable.sortedCompositionTimeOffsets) {
